@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Line Scan Effect</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.2/p5.min.js"></script>
+  <script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex));
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+  </script>
+  <style>
+    body {
+      margin: 0;
+      background-color: #000;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      font-family: Arial, sans-serif;
+      color: #fff;
+    }
+    canvas {
+      border: 1px solid #fff;
+      margin-bottom: 20px;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px;
+      background-color: #1a1a1a;
+      border-radius: 8px;
+    }
+    button, select, input[type="file"]::file-selector-button {
+      padding: 8px 16px;
+      font-size: 14px;
+      border: none;
+      border-radius: 4px;
+      background-color: #333;
+      color: #fff;
+      cursor: pointer;
+      transition: background-color 0.2s;
+      height: 36px;
+      box-sizing: border-box;
+    }
+    button:hover, select:hover, input[type="file"]::file-selector-button:hover {
+      background-color: #555;
+    }
+    select {
+      background-color: #333;
+      height: 36px;
+    }
+    input[type="range"] {
+      margin: 0 10px;
+      vertical-align: middle;
+      height: 36px;
+      accent-color: #666;
+    }
+    label {
+      display: flex;
+      align-items: center;
+      font-size: 14px;
+      color: #fff;
+    }
+    input[type="file"] {
+      color: #fff;
+    }
+  </style>
+</head>
+<body>
+  <div class="controls">
+    <button id="startStop">Start</button>
+    <select id="direction">
+      <option value="vertical" selected>Vertical</option>
+      <option value="horizontal">Horizontal</option>
+    </select>
+    <label>Speed: <input id="speed" type="range" min="1" max="20" value="3"></label>
+    <button id="save">Save PNG</button>
+    <input id="upload" type="file" accept="image/*">
+    <button id="switch">Use Camera</button>
+  </div>
+
+<script>
+let capture = null;
+let img = null;
+let isScanning = false;
+let scanPos = 0;
+let result, graySource; // Removed preview
+let isCamera = false;
+let imgPosX = 0;
+let imgPosY = 0;
+let imgWidth = 1024;
+let imgHeight = 1024;
+let isDragging = false;
+let lastURL = null;
+
+function setup() {
+  createCanvas(1024, 1024);
+  result = createGraphics(1024, 1024);
+  graySource = createGraphics(1024, 1024);
+  result.background(0);
+
+  // Event listeners
+  select('#startStop').mousePressed(toggleScan);
+  select('#save').mousePressed(saveImage);
+  select('#upload').changed(loadUploadedImage);
+  select('#switch').mousePressed(switchToCamera);
+}
+
+function updateGraySource(source) {
+  graySource.background(0); // Clear previous content
+  let srcW = source.width;
+  let srcH = source.height;
+  let srcX, srcY, srcSize, dstX, dstY;
+
+  // Scale to cover 1024x1024 canvas (like CSS object-fit: cover)
+  let aspectRatio = srcW / srcH;
+  if (aspectRatio > 1) {
+    // Wider than tall: scale height to 1024, crop width
+    srcSize = srcH;
+    srcX = (srcW - srcH) / 2; // Center crop horizontally
+    srcY = 0;
+  } else {
+    // Taller than wide: scale width to 1024, crop height
+    srcSize = srcW;
+    srcX = 0;
+    srcY = (srcH - srcW) / 2; // Center crop vertically
+  }
+
+  // Apply offsets and draw to fill canvas
+  dstX = imgPosX;
+  dstY = imgPosY;
+  graySource.image(source, dstX, dstY, 1024, 1024, srcX, srcY, srcSize, srcSize);
+  graySource.filter(GRAY);
+}
+
+function drawDefaultText() {
+  textAlign(CENTER, CENTER);
+  textSize(24);
+  fill(255);
+  textLeading(30);
+  text(
+    "IOCK Knowledge Warper v1.0\nUpload image or use the camera to start.\nManipulate with mouse or arrow keys.",
+    width / 2,
+    height / 2
+  );
+}
+
+function draw() {
+  background(0);
+
+  let source = isCamera ? capture : img;
+  if (!source || source.width <= 0 || source.height <= 0) {
+    drawDefaultText();
+    return;
+  }
+
+  // Update grayscale source for scanning
+  updateGraySource(source);
+
+  // Update scan
+  if (isScanning) {
+    let speed = parseInt(select('#speed').value());
+    let direction = select('#direction').value();
+
+    if (direction === 'horizontal') {
+      // Sample the column at scanPos
+      if (scanPos >= 0 && scanPos < width) {
+        result.image(graySource, scanPos, 0, 1, height, scanPos, 0, 1, height);
+      }
+      scanPos += speed;
+      if (scanPos >= width) {
+        isScanning = false;
+        select('#startStop').html('Start');
+      }
+    } else {
+      // Sample the row at scanPos
+      if (scanPos >= 0 && scanPos < height) {
+        result.image(graySource, 0, scanPos, width, 1, 0, scanPos, width, 1);
+      }
+      scanPos += speed;
+      if (scanPos >= height) {
+        isScanning = false;
+        select('#startStop').html('Start');
+      }
+    }
+  }
+
+  // Draw scanned result
+  image(result, 0, 0);
+
+  // Draw unscanned area in image mode with transparency
+  if (!isCamera && isScanning) {
+    push();
+    tint(255, 128); // 50% opacity
+    let direction = select('#direction').value();
+    if (direction === 'horizontal') {
+      let unscannedWidth = width - scanPos;
+      if (scanPos >= 0 && scanPos < width && unscannedWidth > 0) {
+        image(graySource, scanPos, 0, unscannedWidth, height, scanPos, 0, unscannedWidth, height);
+      }
+    } else {
+      let unscannedHeight = height - scanPos;
+      if (scanPos >= 0 && scanPos < height && unscannedHeight > 0) {
+        image(graySource, 0, scanPos, width, unscannedHeight, 0, scanPos, width, unscannedHeight);
+      }
+    }
+    pop();
+  }
+
+  // Draw source for interactivity (camera or image)
+  image(graySource, imgPosX, imgPosY, imgWidth, imgHeight);
+
+  // Draw scan line
+  if (isScanning) {
+    let direction = select('#direction').value();
+    stroke(255, 0, 0);
+    noFill();
+    if (direction === 'horizontal') {
+      line(scanPos, 0, scanPos, height);
+    } else {
+      line(0, scanPos, width, scanPos);
+    }
+  }
+}
+
+function toggleScan() {
+  isScanning = !isScanning;
+  if (isScanning) {
+    scanPos = 0;
+    result.background(0);
+    select('#startStop').html('Stop');
+  } else {
+    select('#startStop').html('Start');
+  }
+}
+
+function saveImage() {
+  saveCanvas(result, 'constructedKnowledge', 'png');
+}
+
+function loadUploadedImage() {
+  let file = select('#upload').elt.files[0];
+  if (!file) return;
+
+  // Clean up previous resources
+  if (lastURL) {
+    URL.revokeObjectURL(lastURL);
+    lastURL = null;
+  }
+  if (capture) {
+    capture.remove();
+    capture = null;
+  }
+
+  // Clear canvas and graphics
+  background(0);
+  result.background(0);
+  graySource.background(0); // Clear graySource
+
+  lastURL = URL.createObjectURL(file);
+  img = loadImage(lastURL, () => {
+    isCamera = false;
+    select('#switch').html('Use Camera');
+
+    // Set canvas dimensions, scaling handled in updateGraySource
+    imgWidth = 1024;
+    imgHeight = 1024;
+    imgPosX = 0;
+    imgPosY = 0;
+  });
+}
+
+function switchToCamera() {
+  // Clean up previous resources
+  if (capture) {
+    capture.remove();
+    capture = null;
+  }
+  if (lastURL) {
+    URL.revokeObjectURL(lastURL);
+    lastURL = null;
+  }
+  img = null;
+
+  // Initialize capture (use native resolution)
+  capture = createCapture(VIDEO);
+  capture.hide();
+
+  // Set square dimensions
+  imgPosX = 0;
+  imgPosY = 0;
+  imgWidth = 1024;
+  imgHeight = 1024;
+  isCamera = true;
+  select('#switch').html('Use Camera');
+
+  // Clear canvas and graphics
+  background(0);
+  result.background(0);
+  graySource.background(0); // Clear graySource
+}
+
+// Clean up mouse and key event handlers remain unchanged
+function mousePressed() {
+  if (mouseX >= 0 && mouseX <= width && mouseY >= 0 && mouseY <= height) {
+    isDragging = true;
+  }
+}
+
+function mouseDragged() {
+  if (isDragging) {
+    imgPosX += mouseX - pmouseX;
+    imgPosY += mouseY - pmouseY;
+  }
+}
+
+function mouseReleased() {
+  isDragging = false;
+}
+
+function keyPressed() {
+  const step = 5;
+  if (keyCode === LEFT_ARROW) {
+    imgPosX -= step;
+  } else if (keyCode === RIGHT_ARROW) {
+    imgPosX += step;
+  } else if (keyCode === UP_ARROW) {
+    imgPosY -= step;
+  } else if (keyCode === DOWN_ARROW) {
+    imgPosY += step;
+  }
+}
+
+// Clean up resources when window is closed
+window.onbeforeunload = () => {
+  if (lastURL) {
+    URL.revokeObjectURL(lastURL);
+  }
+  if (capture) {
+    capture.remove();
+  }
+};
+</script>
+</body>
+</html>
